@@ -1,0 +1,85 @@
+# Starter pipeline
+
+variables:
+- group: Databricks-environment
+
+trigger:
+- release
+- master
+
+pool:
+  name: Hosted Ubuntu 1604
+
+steps:
+- task: UsePythonVersion@0
+  displayName: 'Use Python 3.7'
+  inputs:
+    versionSpec: 3.7
+
+- script: |
+    pip install pytest requests setuptools wheel pyspark==2.4.5 databricks-cli
+    # pip install -U databricks-connect==6.3.*
+  displayName: 'Load Python Dependencies'
+
+- checkout: self
+  persistCredentials: true
+  clean: true
+
+- script: git checkout master
+  displayName: 'Get Latest Branch'
+
+- script: |
+    python -m pytest --junit-xml=$(Build.Repository.LocalPath)/logs/TEST-LOCAL.xml $(Build.Repository.LocalPath)/libraries/python/dbxdemo/test*.py || true
+    ls logs
+  displayName: 'Run Python Unit Tests for library code'
+
+- task: PublishTestResults@2
+  inputs:
+    testResultsFiles: '**/TEST-*.xml'
+    failTaskOnFailedTests: true
+    publishRunAttachments: true
+
+- script: |
+    cd $(Build.Repository.LocalPath)/libraries/python/dbxdemo
+    python3 setup.py sdist bdist_wheel
+    ls dist/
+  displayName: 'Build Python Wheel for Libs'
+
+- script: |
+    git diff --name-only --diff-filter=AMR HEAD^1 HEAD | xargs -I '{}' cp --parents -r '{}' $(Build.BinariesDirectory)
+    
+    mkdir -p $(Build.BinariesDirectory)/libraries/python/libs
+    cp $(Build.Repository.LocalPath)/libraries/python/dbxdemo/dist/*.* $(Build.BinariesDirectory)/libraries/python/libs
+  displayName: 'Get Changes / Copy library locally'  
+
+- task: riserrad.azdo-databricks.azdo-databricks-configuredatabricks.configuredatabricks@0
+  inputs:
+    url: '$(WORKSPACE-REGION-URL)?o=$(WORKSPACE-ORG-ID)'
+    token: '$(TOKEN)'
+  displayName: 'Configure Databricks CLI for AZDO'
+
+
+- bash: |
+    export WHEEL_PATH=`ls $(Build.BinariesDirectory)/libraries/python/libs/*.whl`
+    export WHEEL_FILENAME=`basename $WHEEL_PATH`
+    echo "Wheel file path: $WHEEL_PATH"
+    echo "Wheel file name: $WHEEL_FILENAME"
+    echo "##vso[task.setvariable variable=WHEEL_FILENAME_GLOBAL]$WHEEL_FILENAME"
+  displayName: 'Compute the wheel filename'
+
+- script: |
+    cat /home/vsts/.databrickscfg
+    echo "databricks fs cp --overwrite $(Build.BinariesDirectory)/libraries/python/libs/$(WHEEL_FILENAME_GLOBAL) dbfs:/Users/$(USERNAME)/$(WHEEL_FILENAME_GLOBAL)"
+    databricks fs cp --overwrite $(Build.BinariesDirectory)/libraries/python/libs/$(WHEEL_FILENAME_GLOBAL) dbfs:/Users/$(USERNAME)/$(WHEEL_FILENAME_GLOBAL) --profile AZDO
+  displayName: 'Databricks fs cp'
+
+- task: riserrad.azdo-databricks.azdo-databricks-startcluster.startcluster@0
+  inputs:
+    clusterid: '$(EXISTING-CLUSTER-ID)'
+    failOnStderr: false
+    timeoutInMinutes: 6
+  displayName: 'Make sure that the $(EXISTING-CLUSTER-ID) cluster is up and running'
+
+- script: |
+    databricks libraries install --cluster-id $(EXISTING-CLUSTER-ID) --whl dbfs:/Users/$(USERNAME)/$(WHEEL_FILENAME_GLOBAL) --profile AZDO
+  displayName: 'Install the $(WHEEL_FILENAME_GLOBAL) library in the $(EXISTING-CLUSTER-ID) cluster'
